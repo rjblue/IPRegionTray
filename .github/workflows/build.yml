@@ -1,0 +1,25 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build app
+        run: ./scripts/build-app.sh
+
+      - name: Verify app
+        run: |
+          plutil -lint Resources/Info.plist dist/IPRegionTray.app/Contents/Info.plist
+          file dist/IPRegionTray.app/Contents/MacOS/IPRegionTray
+          codesign --verify --deep --strict --verbose=2 dist/IPRegionTray.app
