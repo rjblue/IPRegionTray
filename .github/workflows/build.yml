@@ -22,4 +22,5 @@ jobs:
         run: |
           plutil -lint Resources/Info.plist dist/IPRegionTray.app/Contents/Info.plist
           file dist/IPRegionTray.app/Contents/MacOS/IPRegionTray
+          lipo -archs dist/IPRegionTray.app/Contents/MacOS/IPRegionTray | grep -qx arm64
           codesign --verify --deep --strict --verbose=2 dist/IPRegionTray.app
