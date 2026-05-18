@@ -36,13 +36,13 @@ open dist/IPRegionTray.app
 ## Create a Release Package
 
 ```bash
-./scripts/package-release.sh 1.0.0
+./scripts/package-release.sh 1.1.0
 ```
 
 Package output:
 
 ```text
-release/IPRegionTray-1.0.0-mac-arm64.zip
+release/IPRegionTray-1.1.0-mac-arm64.zip
 ```
 
 ## Implementation Notes
@@ -50,5 +50,9 @@ release/IPRegionTray-1.0.0-mac-arm64.zip
 - `NSStatusItem` renders the menu bar icon and country code.
 - `URLSessionConfiguration.ephemeral` avoids persistent cache state.
 - `_ip_region_tray_nocache=<UUID>` makes each request URL unique.
-- `NWPathMonitor` refreshes immediately after network path changes.
-- `UserDefaults` stores the data source URL and refresh interval.
+- `NWPathMonitor` captures network path changes.
+- `SCDynamicStore` captures proxy, DNS, interface, virtual adapter, IPv4, and IPv6 changes.
+- `NSWorkspace.didWakeNotification` catches wake-from-sleep changes.
+- `NetworkFingerprint` hashes local network state so external requests happen only when meaningful state changes.
+- A debounced minimum interval and error backoff prevent high-frequency endpoint access.
+- `UserDefaults` stores the data source URL and minimum refresh interval.

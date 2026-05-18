@@ -7,13 +7,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v1.0.0"
+        description: "Release tag, for example v1.1.0"
         required: true
-        default: "v1.0.0"
+        default: "v1.1.0"
       version:
-        description: "Package version, for example 1.0.0"
+        description: "Package version, for example 1.1.0"
         required: true
-        default: "1.0.0"
+        default: "1.1.0"
 
 permissions:
   contents: write
@@ -37,8 +37,13 @@ jobs:
             tag="${GITHUB_REF_NAME}"
             version="${tag#v}"
           fi
+          notes="RELEASE_NOTES_v$version.md"
+          if [[ ! -f "$notes" ]]; then
+            notes="RELEASE_NOTES_v1.0.0.md"
+          fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
 
       - name: Build release package
         run: ./scripts/package-release.sh "${{ steps.version.outputs.version }}"
@@ -60,6 +65,6 @@ jobs:
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: IPRegionTray ${{ steps.version.outputs.version }}
-          body_path: RELEASE_NOTES_v1.0.0.md
+          body_path: ${{ steps.version.outputs.notes }}
           files: release/IPRegionTray-${{ steps.version.outputs.version }}-mac-arm64.zip
           fail_on_unmatched_files: true

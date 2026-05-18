@@ -36,13 +36,13 @@ open dist/IPRegionTray.app
 ## 生成发布包
 
 ```bash
-./scripts/package-release.sh 1.0.0
+./scripts/package-release.sh 1.1.0
 ```
 
 发布包位置：
 
 ```text
-release/IPRegionTray-1.0.0-mac-arm64.zip
+release/IPRegionTray-1.1.0-mac-arm64.zip
 ```
 
 ## 关键实现
@@ -51,4 +51,8 @@ release/IPRegionTray-1.0.0-mac-arm64.zip
 - `URLSessionConfiguration.ephemeral`：避免使用持久缓存
 - 随机 `_ip_region_tray_nocache` query：强制每次请求唯一 URL
 - `NWPathMonitor`：监听系统网络路径变化
-- `UserDefaults`：保存数据源和刷新频率
+- `SCDynamicStore`：监听代理、DNS、网卡、虚拟网卡、IPv4 和 IPv6 变化
+- `NSWorkspace.didWakeNotification`：监听系统睡眠唤醒
+- `NetworkFingerprint`：对本地网络状态做哈希，只有状态实际变化时才触发外部请求
+- 防抖、最小刷新间隔和错误退避用于避免高频访问数据源
+- `UserDefaults`：保存数据源和最小刷新间隔

@@ -18,16 +18,18 @@ IPRegionTray 是一个原生 macOS 菜单栏应用，用来显示当前公网 IP
 ## 默认行为
 
 - 默认数据源：`https://ipinfo.io/json`
-- 默认刷新频率：每 `3` 秒刷新一次
-- 网络环境变化时，会立即触发一次刷新
+- 使用事件驱动刷新，不再固定轮询
+- 默认最小外部请求间隔：`60` 秒
+- 监听网络路径、代理、DNS、网卡、虚拟网卡和系统唤醒事件
 - 每次请求都会追加随机 query 参数，避免拿到缓存数据
+- 遇到限流、封锁、服务端错误或网络错误时自动退避
 
 ## 配置
 
 点击菜单栏图标，选择 `Settings...`，可以修改：
 
 - Data source URL：数据源 URL
-- Refresh seconds：刷新间隔秒数
+- Minimum refresh seconds：最小刷新间隔秒数
 
 配置会保存到 macOS `UserDefaults`。
 

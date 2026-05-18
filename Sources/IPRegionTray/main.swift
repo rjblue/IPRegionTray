@@ -1,7 +1,9 @@
 import AppKit
+import CryptoKit
 import Foundation
 import Network
 import OSLog
+import SystemConfiguration
 
 struct IPInfoResponse: Decodable {
     let ip: String?
@@ -14,25 +16,39 @@ struct IPInfoResponse: Decodable {
 
 struct AppConfig {
     static let defaultURL = "https://ipinfo.io/json"
-    static let defaultRefreshInterval: TimeInterval = 3
+    static let defaultMinimumRefreshInterval: TimeInterval = 60
+    static let minimumAllowedRefreshInterval: TimeInterval = 15
     static let urlKey = "sourceURL"
-    static let refreshIntervalKey = "refreshInterval"
+    static let minimumRefreshIntervalKey = "minimumRefreshInterval"
+    static let legacyRefreshIntervalKey = "refreshInterval"
 
     var sourceURL: URL
-    var refreshInterval: TimeInterval
+    var minimumRefreshInterval: TimeInterval
 
     static func load() -> AppConfig {
         let defaults = UserDefaults.standard
         let urlString = defaults.string(forKey: urlKey) ?? defaultURL
         let sourceURL = URL(string: urlString) ?? URL(string: defaultURL)!
-        let savedInterval = defaults.double(forKey: refreshIntervalKey)
-        let refreshInterval = savedInterval > 0 ? savedInterval : defaultRefreshInterval
-        return AppConfig(sourceURL: sourceURL, refreshInterval: max(1, refreshInterval))
+        let savedMinimumInterval = defaults.double(forKey: minimumRefreshIntervalKey)
+        let legacyInterval = defaults.double(forKey: legacyRefreshIntervalKey)
+        let interval: TimeInterval
+        if savedMinimumInterval > 0 {
+            interval = savedMinimumInterval
+        } else if legacyInterval > 0 {
+            interval = max(defaultMinimumRefreshInterval, legacyInterval)
+        } else {
+            interval = defaultMinimumRefreshInterval
+        }
+
+        return AppConfig(
+            sourceURL: sourceURL,
+            minimumRefreshInterval: max(minimumAllowedRefreshInterval, interval)
+        )
     }
 
     func save() {
         UserDefaults.standard.set(sourceURL.absoluteString, forKey: Self.urlKey)
-        UserDefaults.standard.set(refreshInterval, forKey: Self.refreshIntervalKey)
+        UserDefaults.standard.set(minimumRefreshInterval, forKey: Self.minimumRefreshIntervalKey)
     }
 }
 
@@ -42,26 +58,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let monitor = NWPathMonitor()
     private let monitorQueue = DispatchQueue(label: "ip-region-tray.network-monitor")
-    private var refreshTimer: Timer?
+    private var dynamicStore: SCDynamicStore?
+    private var dynamicStoreRunLoopSource: CFRunLoopSource?
+    private var debounceWorkItem: DispatchWorkItem?
+    private var scheduledRefreshWorkItem: DispatchWorkItem?
     private var settingsWindowController: SettingsWindowController?
     private var config = AppConfig.load()
     private var currentInfo: IPInfoResponse?
     private var lastError: String?
     private var lastUpdatedAt: Date?
+    private var lastExternalRequestAt: Date?
+    private var lastObservedEventAt: Date?
+    private var lastObservedReason: String?
+    private var latestNetworkFingerprint: String?
+    private var backoffUntil: Date?
+    private var backoffStep = 0
     private var fetchTask: Task<Void, Never>?
-    private var didReceiveFirstNetworkPath = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         configureStatusItem()
-        startRefreshTimer()
         startNetworkMonitor()
-        refreshNow()
+        startSystemConfigurationMonitor()
+        startWorkspaceMonitor()
+        handleNetworkSignal(reason: "Startup", forceFingerprintChange: true)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        refreshTimer?.invalidate()
+        debounceWorkItem?.cancel()
+        scheduledRefreshWorkItem?.cancel()
         monitor.cancel()
+        stopSystemConfigurationMonitor()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
         fetchTask?.cancel()
     }
 
@@ -99,9 +127,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
         menu.addItem(disabledItem("Source: \(config.sourceURL.absoluteString)"))
-        menu.addItem(disabledItem("Refresh: \(formatInterval(config.refreshInterval))"))
+        menu.addItem(disabledItem("Refresh: event-driven"))
+        menu.addItem(disabledItem("Minimum interval: \(formatInterval(config.minimumRefreshInterval))"))
         if let lastUpdatedAt {
             menu.addItem(disabledItem("Last updated: \(formatDate(lastUpdatedAt))"))
+        }
+        if let lastObservedReason {
+            menu.addItem(disabledItem("Last signal: \(lastObservedReason)"))
+        }
+        if let backoffUntil, backoffUntil > Date() {
+            menu.addItem(disabledItem("Backoff until: \(formatDate(backoffUntil))"))
+        } else if let nextAllowedRefreshDate, nextAllowedRefreshDate > Date() {
+            menu.addItem(disabledItem("Next allowed: \(formatDate(nextAllowedRefreshDate))"))
         }
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Refresh Now", action: #selector(refreshNowFromMenu), keyEquivalent: "r"))
@@ -137,36 +174,175 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return formatter.string(from: date)
     }
 
-    private func startRefreshTimer() {
-        refreshTimer?.invalidate()
-        let timer = Timer(timeInterval: config.refreshInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refreshNow()
-            }
-        }
-        refreshTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
-    }
-
     private func startNetworkMonitor() {
         monitor.pathUpdateHandler = { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
-                if self.didReceiveFirstNetworkPath {
-                    self.refreshNow()
-                }
-                self.didReceiveFirstNetworkPath = true
+                self?.handleNetworkSignal(reason: "Network path changed")
             }
         }
         monitor.start(queue: monitorQueue)
     }
 
-    @objc private func refreshNowFromMenu() {
-        refreshNow()
+    private func startSystemConfigurationMonitor() {
+        let callback: SCDynamicStoreCallBack = { _, changedKeys, info in
+            guard let info else { return }
+            let appDelegate = Unmanaged<AppDelegate>.fromOpaque(info).takeUnretainedValue()
+            let keys = (changedKeys as? [String]) ?? []
+            Task { @MainActor in
+                appDelegate.handleNetworkSignal(reason: appDelegate.describeSystemConfigurationChange(keys))
+            }
+        }
+
+        var context = SCDynamicStoreContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+
+        guard let store = SCDynamicStoreCreate(nil, "IPRegionTray" as CFString, callback, &context) else {
+            logger.error("Failed to create SystemConfiguration dynamic store")
+            return
+        }
+
+        let keys = [
+            "State:/Network/Global/IPv4",
+            "State:/Network/Global/IPv6",
+            "State:/Network/Global/DNS",
+            "State:/Network/Global/Proxies",
+            "Setup:/Network/Global/Proxies"
+        ] as CFArray
+
+        let patterns = [
+            "State:/Network/Service/.*/IPv4",
+            "State:/Network/Service/.*/IPv6",
+            "State:/Network/Service/.*/DNS",
+            "State:/Network/Service/.*/Proxies",
+            "State:/Network/Interface/.*/IPv4",
+            "State:/Network/Interface/.*/IPv6",
+            "State:/Network/Interface/.*/Link",
+            "Setup:/Network/Service/.*/Proxies"
+        ] as CFArray
+
+        guard SCDynamicStoreSetNotificationKeys(store, keys, patterns),
+              let source = SCDynamicStoreCreateRunLoopSource(nil, store, 0) else {
+            logger.error("Failed to register SystemConfiguration notifications")
+            return
+        }
+
+        dynamicStore = store
+        dynamicStoreRunLoopSource = source
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
     }
 
-    private func refreshNow() {
+    private func stopSystemConfigurationMonitor() {
+        if let dynamicStoreRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), dynamicStoreRunLoopSource, .commonModes)
+        }
+        dynamicStoreRunLoopSource = nil
+        dynamicStore = nil
+    }
+
+    private func startWorkspaceMonitor() {
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(systemDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+    }
+
+    @objc private func systemDidWake() {
+        handleNetworkSignal(reason: "System woke")
+    }
+
+    private func describeSystemConfigurationChange(_ keys: [String]) -> String {
+        if keys.contains(where: { $0.contains("Proxies") }) {
+            return "Proxy settings changed"
+        }
+        if keys.contains(where: { $0.contains("/DNS") }) {
+            return "DNS settings changed"
+        }
+        if keys.contains(where: { $0.contains("/Interface/") || $0.contains("/IPv4") || $0.contains("/IPv6") }) {
+            return "Network interface changed"
+        }
+        return "System network settings changed"
+    }
+
+    @objc private func refreshNowFromMenu() {
+        handleNetworkSignal(reason: "Manual refresh", forceFingerprintChange: true, forceRequest: true)
+    }
+
+    private func handleNetworkSignal(
+        reason: String,
+        forceFingerprintChange: Bool = false,
+        forceRequest: Bool = false
+    ) {
+        let fingerprint = NetworkFingerprint.current()
+        let fingerprintChanged = forceFingerprintChange || fingerprint != latestNetworkFingerprint
+        latestNetworkFingerprint = fingerprint
+        lastObservedEventAt = Date()
+        lastObservedReason = reason
+        rebuildMenu()
+
+        guard fingerprintChanged || forceRequest else {
+            logger.info("Ignored unchanged network fingerprint for \(reason, privacy: .public)")
+            return
+        }
+
+        debounceWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor in
+                self?.refreshWhenAllowed(reason: reason, forceRequest: forceRequest)
+            }
+        }
+        debounceWorkItem = workItem
+
+        if forceRequest {
+            DispatchQueue.main.async(execute: workItem)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: workItem)
+        }
+    }
+
+    private var nextAllowedRefreshDate: Date? {
+        var dates: [Date] = []
+        if let lastExternalRequestAt {
+            dates.append(lastExternalRequestAt.addingTimeInterval(config.minimumRefreshInterval))
+        }
+        if let backoffUntil, backoffUntil > Date() {
+            dates.append(backoffUntil)
+        }
+        return dates.max()
+    }
+
+    private func refreshWhenAllowed(reason: String, forceRequest: Bool = false) {
+        scheduledRefreshWorkItem?.cancel()
+        let now = Date()
+
+        if !forceRequest, let nextAllowedRefreshDate, nextAllowedRefreshDate > now {
+            let delay = nextAllowedRefreshDate.timeIntervalSince(now)
+            let workItem = DispatchWorkItem { [weak self] in
+                Task { @MainActor in
+                    self?.refreshWhenAllowed(reason: reason)
+                }
+            }
+            scheduledRefreshWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+            rebuildMenu()
+            logger.info("Delayed refresh for \(reason, privacy: .public) by \(delay, privacy: .public)s")
+            return
+        }
+
+        refreshNow(reason: reason)
+    }
+
+    private func refreshNow(reason: String) {
         fetchTask?.cancel()
+        lastExternalRequestAt = Date()
+        lastObservedReason = reason
+        rebuildMenu()
 
         let request = makeRequest(for: config.sourceURL)
         let urlSession = makeURLSession()
@@ -186,8 +362,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 let decoded = try JSONDecoder().decode(IPInfoResponse.self, from: data)
-                logger.info("Fetched ip=\(decoded.ip ?? "--", privacy: .public) country=\(decoded.country ?? "--", privacy: .public)")
+                logger.info("Fetched IP region data successfully")
                 await MainActor.run {
+                    self.backoffStep = 0
+                    self.backoffUntil = nil
                     self.currentInfo = decoded
                     self.lastError = nil
                     self.lastUpdatedAt = Date()
@@ -199,12 +377,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } catch {
                 logger.error("Fetch failed: \(error.localizedDescription, privacy: .public)")
                 await MainActor.run {
+                    self.applyBackoff(for: error)
                     self.lastError = error.localizedDescription
-                    self.updateStatusTitle(country: nil)
+                    self.updateStatusTitle(country: self.currentInfo?.country)
                     self.rebuildMenu()
                 }
             }
         }
+    }
+
+    private func applyBackoff(for error: Error) {
+        let baseDelay: TimeInterval
+        if case FetchError.badStatus(let statusCode) = error {
+            if statusCode == 403 || statusCode == 429 {
+                baseDelay = 15 * 60
+            } else if statusCode >= 500 {
+                baseDelay = 5 * 60
+            } else {
+                return
+            }
+        } else {
+            baseDelay = 2 * 60
+        }
+
+        backoffStep = min(backoffStep + 1, 5)
+        let delay = min(baseDelay * pow(2, Double(backoffStep - 1)), 60 * 60)
+        backoffUntil = Date().addingTimeInterval(delay)
     }
 
     private func makeURLSession() -> URLSession {
@@ -264,9 +462,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 self.config = newConfig
                 self.config.save()
-                self.startRefreshTimer()
                 self.rebuildMenu()
-                self.refreshNow()
+                self.handleNetworkSignal(reason: "Settings changed", forceFingerprintChange: true, forceRequest: true)
             }
         }
 
@@ -292,18 +489,107 @@ enum FetchError: LocalizedError {
     }
 }
 
+struct NetworkFingerprint {
+    static func current() -> String {
+        var parts: [String] = []
+        parts.append("proxies=\(stableDescription(SCDynamicStoreCopyProxies(nil)))")
+
+        for key in [
+            "State:/Network/Global/IPv4",
+            "State:/Network/Global/IPv6",
+            "State:/Network/Global/DNS",
+            "State:/Network/Global/Proxies",
+            "Setup:/Network/Global/Proxies"
+        ] {
+            if let value = SCDynamicStoreCopyValue(nil, key as CFString) {
+                parts.append("\(key)=\(stableDescription(value))")
+            }
+        }
+
+        parts.append("interfaces=\(interfaceSnapshot())")
+        let joined = parts.joined(separator: "\n")
+        let digest = SHA256.hash(data: Data(joined.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func stableDescription(_ value: Any?) -> String {
+        guard let value else { return "nil" }
+        if JSONSerialization.isValidJSONObject(value),
+           let data = try? JSONSerialization.data(withJSONObject: value, options: [.sortedKeys]),
+           let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+        return String(describing: value)
+    }
+
+    private static func interfaceSnapshot() -> String {
+        var pointer: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&pointer) == 0, let first = pointer else {
+            return "unavailable"
+        }
+        defer { freeifaddrs(pointer) }
+
+        var rows: [String] = []
+        var current: UnsafeMutablePointer<ifaddrs>? = first
+        while let entry = current {
+            defer { current = entry.pointee.ifa_next }
+            let flags = Int32(entry.pointee.ifa_flags)
+            guard flags & IFF_UP != 0 else { continue }
+            let name = String(cString: entry.pointee.ifa_name)
+            guard !name.isEmpty else { continue }
+
+            var family = "link"
+            var address = ""
+            if let socketAddress = entry.pointee.ifa_addr {
+                switch Int32(socketAddress.pointee.sa_family) {
+                case AF_INET:
+                    family = "ipv4"
+                    address = numericAddress(socketAddress)
+                case AF_INET6:
+                    family = "ipv6"
+                    address = numericAddress(socketAddress)
+                case AF_LINK:
+                    family = "link"
+                default:
+                    continue
+                }
+            }
+
+            rows.append("\(name):\(family):\(flags):\(address)")
+        }
+
+        return rows.sorted().joined(separator: "|")
+    }
+
+    private static func numericAddress(_ socketAddress: UnsafePointer<sockaddr>) -> String {
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let length = socklen_t(socketAddress.pointee.sa_len)
+        let result = getnameinfo(
+            socketAddress,
+            length,
+            &host,
+            socklen_t(host.count),
+            nil,
+            0,
+            NI_NUMERICHOST
+        )
+        guard result == 0 else { return "" }
+        return String(cString: host)
+    }
+}
+
 @MainActor
 final class SettingsWindowController: NSWindowController {
     var config: AppConfig {
         didSet {
             sourceField.stringValue = config.sourceURL.absoluteString
-            intervalField.doubleValue = config.refreshInterval
+            minimumIntervalField.doubleValue = config.minimumRefreshInterval
         }
     }
 
     private let onSave: (AppConfig) -> Void
     private let sourceField = NSTextField()
-    private let intervalField = NSTextField()
+    private let minimumIntervalField = NSTextField()
     private let errorLabel = NSTextField(labelWithString: "")
 
     init(config: AppConfig, onSave: @escaping (AppConfig) -> Void) {
@@ -311,7 +597,7 @@ final class SettingsWindowController: NSWindowController {
         self.onSave = onSave
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 184),
+            contentRect: NSRect(x: 0, y: 0, width: 500, height: 198),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -348,11 +634,11 @@ final class SettingsWindowController: NSWindowController {
         sourceField.stringValue = config.sourceURL.absoluteString
         sourceField.placeholderString = AppConfig.defaultURL
 
-        intervalField.stringValue = String(Int(config.refreshInterval))
-        intervalField.placeholderString = "3"
+        minimumIntervalField.stringValue = String(Int(config.minimumRefreshInterval))
+        minimumIntervalField.placeholderString = String(Int(AppConfig.defaultMinimumRefreshInterval))
 
         stack.addArrangedSubview(row(label: "Data source URL", control: sourceField))
-        stack.addArrangedSubview(row(label: "Refresh seconds", control: intervalField))
+        stack.addArrangedSubview(row(label: "Minimum refresh seconds", control: minimumIntervalField))
 
         errorLabel.textColor = .systemRed
         errorLabel.lineBreakMode = .byWordWrapping
@@ -400,20 +686,21 @@ final class SettingsWindowController: NSWindowController {
 
     @objc private func save() {
         let urlString = sourceField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let intervalString = intervalField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let intervalString = minimumIntervalField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
 
         guard let url = URL(string: urlString), url.scheme != nil, url.host != nil else {
             errorLabel.stringValue = "Please enter a valid URL."
             return
         }
 
-        guard let interval = TimeInterval(intervalString), interval >= 1 else {
-            errorLabel.stringValue = "Refresh seconds must be 1 or greater."
+        guard let interval = TimeInterval(intervalString),
+              interval >= AppConfig.minimumAllowedRefreshInterval else {
+            errorLabel.stringValue = "Minimum refresh seconds must be \(Int(AppConfig.minimumAllowedRefreshInterval)) or greater."
             return
         }
 
         errorLabel.stringValue = ""
-        onSave(AppConfig(sourceURL: url, refreshInterval: interval))
+        onSave(AppConfig(sourceURL: url, minimumRefreshInterval: interval))
         window?.close()
     }
 }

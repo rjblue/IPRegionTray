@@ -21,7 +21,8 @@ Country: SG
 IP: 103.211.230.150
 Region: Singapore
 Source: https://ipinfo.io/json
-Refresh: 3s
+Refresh: event-driven
+Minimum interval: 60s
 Last updated: 14:42:10
 ```
 
@@ -40,9 +41,11 @@ Typical use cases:
 
 - Native macOS menu bar app built with Swift and AppKit.
 - Shows the `country` field from `https://ipinfo.io/json`, for example `SG`.
-- Refreshes every `3` seconds by default.
-- Data source URL and refresh interval are configurable.
-- Refreshes immediately when macOS reports a network path change.
+- Event-driven refresh instead of constant polling.
+- Watches macOS network path, proxy, DNS, interface, virtual adapter, and wake events.
+- Data source URL and minimum refresh interval are configurable.
+- Default minimum external request interval is `60` seconds.
+- Uses backoff after rate-limit, blocked, server, or network errors.
 - Uses a fresh ephemeral URL session and a random no-cache query on every request.
 - No Dock icon; it lives quietly in the menu bar.
 - Apple Silicon `arm64` build.
@@ -54,7 +57,7 @@ Download the latest binary package from GitHub Releases.
 The release package contains:
 
 ```text
-IPRegionTray-1.0.0/
+IPRegionTray-1.1.0/
   app/                 IPRegionTray.app
   executable/          standalone arm64 executable
   source/              source code and build script
@@ -64,7 +67,7 @@ IPRegionTray-1.0.0/
 
 ## Install
 
-1. Download `IPRegionTray-1.0.0-mac-arm64.zip` from Releases.
+1. Download `IPRegionTray-1.1.0-mac-arm64.zip` from Releases.
 2. Unzip it.
 3. Open `app/IPRegionTray.app`.
 
@@ -82,7 +85,7 @@ Click the menu bar item to:
 Open `Settings...` to change:
 
 - data source URL
-- refresh interval in seconds
+- minimum refresh interval in seconds
 
 Settings are stored in macOS `UserDefaults`.
 
@@ -115,6 +118,8 @@ Expected JSON shape:
 ```
 
 IPRegionTray reads the top-level `country` field and displays it in the menu bar.
+
+IPRegionTray does not poll the endpoint on a timer. It builds a local network fingerprint from macOS network state, proxy settings, DNS settings, and active interfaces. When that fingerprint changes, it debounces the signal and refreshes only after the configured minimum interval allows another external request. This catches changes such as VPN/proxy mode switches, PAC/global proxy changes, DNS changes, interface changes, virtual adapter changes, and wake-from-sleep events without continuously hitting the data source.
 
 To avoid stale data, every refresh adds a meaningless random query parameter:
 
@@ -158,7 +163,11 @@ Create a local release package:
 ./scripts/build-app.sh
 ```
 
-Then copy the built app from `dist/IPRegionTray.app`, or use the prebuilt package from GitHub Releases.
+Create a release-style package:
+
+```bash
+./scripts/package-release.sh 1.1.0
+```
 
 ## Project Structure
 

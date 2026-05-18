@@ -21,7 +21,8 @@ Country: SG
 IP: 103.211.230.150
 Region: Singapore
 Source: https://ipinfo.io/json
-Refresh: 3s
+Refresh: event-driven
+Minimum interval: 60s
 Last updated: 14:42:10
 ```
 
@@ -40,9 +41,11 @@ Last updated: 14:42:10
 
 - Swift + AppKit 原生 macOS 菜单栏应用。
 - 读取 `https://ipinfo.io/json` 返回的 `country` 字段，例如 `SG`。
-- 默认每 `3` 秒刷新一次。
-- 数据源 URL 和刷新间隔可配置。
-- macOS 检测到网络路径变化时立即刷新。
+- 使用事件驱动刷新，不再固定高频轮询。
+- 监听网络路径、代理、DNS、网卡、虚拟网卡和系统唤醒事件。
+- 数据源 URL 和最小刷新间隔可配置。
+- 默认最小外部请求间隔为 `60` 秒。
+- 遇到限流、封锁、服务端错误或网络错误时自动退避。
 - 每次请求都会追加随机无意义 query，避免缓存导致的旧数据。
 - 不显示 Dock 图标，只驻留在菜单栏。
 - 支持 Apple Silicon `arm64`。
@@ -54,7 +57,7 @@ Last updated: 14:42:10
 发布包结构：
 
 ```text
-IPRegionTray-1.0.0/
+IPRegionTray-1.1.0/
   app/                 IPRegionTray.app
   executable/          独立 arm64 可执行文件
   source/              源码和构建脚本
@@ -64,7 +67,7 @@ IPRegionTray-1.0.0/
 
 ## 安装
 
-1. 从 Releases 下载 `IPRegionTray-1.0.0-mac-arm64.zip`。
+1. 从 Releases 下载 `IPRegionTray-1.1.0-mac-arm64.zip`。
 2. 解压。
 3. 打开 `app/IPRegionTray.app`。
 
@@ -82,7 +85,7 @@ IPRegionTray-1.0.0/
 打开 `Settings...` 可以修改：
 
 - 数据源 URL
-- 刷新间隔秒数
+- 最小刷新间隔秒数
 
 配置会保存到 macOS `UserDefaults`。
 
@@ -115,6 +118,8 @@ https://ipinfo.io/json
 ```
 
 IPRegionTray 会读取顶层 `country` 字段并显示在菜单栏。
+
+IPRegionTray 不再按固定计时器轮询接口。它会根据 macOS 网络状态、代理设置、DNS 设置和活跃网卡生成本地网络指纹。当指纹变化时，应用会先做短暂防抖，再根据配置的最小刷新间隔决定是否请求外部数据源。这样可以覆盖 VPN/代理模式切换、PAC/全局代理变化、DNS 变化、网卡变化、虚拟网卡变化和睡眠唤醒等场景，同时避免持续打接口。
 
 为了避免旧数据，每次刷新都会追加一个随机 query：
 

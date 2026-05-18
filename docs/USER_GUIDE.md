@@ -19,9 +19,11 @@ IPRegionTray is a native macOS menu bar app that shows the country or region cod
 ## Default Behavior
 
 - Default data source: `https://ipinfo.io/json`
-- Default refresh interval: `3` seconds
-- Refreshes immediately when macOS reports a network path change
+- Event-driven refresh instead of fixed polling
+- Default minimum external request interval: `60` seconds
+- Watches network path, proxy, DNS, interface, virtual adapter, and wake events
 - Adds a random query parameter on every request to avoid stale cached data
+- Uses automatic backoff after rate-limit, blocked, server, or network errors
 
 ## Settings
 
@@ -30,14 +32,14 @@ Open the menu bar item and choose `Settings...`.
 You can change:
 
 - Data source URL
-- Refresh interval in seconds
+- Minimum refresh interval in seconds
 
 Settings are saved in macOS `UserDefaults`.
 
 ## Menu Actions
 
 - `Refresh Now`: fetch the latest IP info immediately
-- `Settings...`: configure data source and refresh interval
+- `Settings...`: configure data source and minimum refresh interval
 - `Quit IP Region Tray`: exit the app
 
 ## If macOS Blocks the App

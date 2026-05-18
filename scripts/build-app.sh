@@ -9,6 +9,8 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 
 cd "$ROOT_DIR"
+export SWIFTPM_MODULECACHE_PATH="${SWIFTPM_MODULECACHE_PATH:-$ROOT_DIR/.build/module-cache}"
+export CLANG_MODULE_CACHE_PATH="${CLANG_MODULE_CACHE_PATH:-$ROOT_DIR/.build/module-cache}"
 swift build -c release --arch arm64
 
 rm -rf "$APP_DIR"
